@@ -38,21 +38,16 @@ PactLens/
 │   │   │   └── llm_service.py        # Google Gemini integration
 │   │   ├── models/schemas.py         # Data models
 │   │   ├── utils/                    # PDF & Vector DB
+│   │   │   ├── pdf_processor.py      # PDF extraction
+│   │   │   └── vector_db.py          # In-memory vector store
 │   │   ├── main.py & config.py
-│   ├── requirements.txt, .env.example
-│   └── data/                         # Uploads & embeddings
-│
-├── docs/
-│   ├── README.md                     # Main documentation
-│   ├── SETUP.md                      # Installation guide (with screenshots)
-│   ├── ARCHITECTURE.md               # Technical details
-│   ├── USAGE.md                      # User guide
-│   ├── QUICK_REF.md                  # Quick reference
-│   ├── PROJECT_SUMMARY.md            # Completion checklist
-│   └── FILE_INDEX.md                 # Complete file listing
+│   ├── venv/                         # Virtual environment
+│   ├── requirements.txt
+│   ├── setup.bat
+│   └── data/                         # Uploaded PDFs
 │
 ├── setup.sh & setup.bat              # Automated setup scripts
-└── .gitignore
+└── README.md
 ```
 
 **See [FILE_INDEX.md](./FILE_INDEX.md) for complete file listing**
