@@ -1,29 +1,29 @@
 """
 PactLens Backend - Analysis API
-Endpoints for contract analysis, contradiction detection, and Q&A
+Session-based analysis with isolated vector collections
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import List
-import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import uuid
+import traceback
+import os
 
-from app.models.schemas import Contradiction, QuestionAnswer
-from app.utils.vector_db import vector_db
+from app.utils.vector_db import VectorDBClient
 from app.rag.pipeline import RAGPipeline
 from app.rag.llm_service import LLMService, EmbeddingsService
+from app.utils.pdf_processor import PDFProcessor
 from app.config import settings
+from app.api.documents import uploaded_documents
 
-# Initialize router
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
-# Initialize services
 embeddings_service = EmbeddingsService(settings.gemini_api_key)
 llm_service = LLMService(settings.gemini_api_key)
-rag_pipeline = RAGPipeline(embeddings_service, llm_service, vector_db)
+rag_pipeline = RAGPipeline(embeddings_service, llm_service)
 
-# Store analysis results in memory
 analysis_cache = {}
 
 
@@ -33,39 +33,94 @@ class AnalyzeRequest(BaseModel):
 
 class QuestionRequest(BaseModel):
     question: str
+    document_ids: List[str] = []
+
+
+def cleanup_old_files(minutes=60):
+    now = datetime.utcnow()
+    to_delete = []
+
+    for doc_id, doc in uploaded_documents.items():
+        uploaded_at = doc.get("uploaded_at")
+        if not uploaded_at:
+            continue
+
+        if now - uploaded_at > timedelta(minutes=minutes):
+            path = doc.get("file_path")
+            if path and os.path.exists(path):
+                os.remove(path)
+            to_delete.append(doc_id)
+
+    for doc_id in to_delete:
+        del uploaded_documents[doc_id]
+
+
+def _build_vector_db_for_documents(document_ids: List[str], collection) -> None:
+    """
+    Populate the provided collection with embeddings for the given documents.
+    Embeddings are added ONLY to this collection (session-scoped).
+    """
+    for doc_id in document_ids:
+        if doc_id not in uploaded_documents:
+            continue
+
+        doc_metadata = uploaded_documents[doc_id]
+        file_path = doc_metadata.get("file_path")
+        if not file_path:
+            continue
+
+        text, _metadata = PDFProcessor.extract_text_and_metadata(file_path)
+        clauses = PDFProcessor.chunk_by_sections(text)
+
+        for idx, clause in enumerate(clauses):
+            embedding = embeddings_service.embed_text(clause["text"])
+            collection.add_clause(
+                clause_id=f"{doc_id}_{idx}",
+                document_id=doc_id,
+                document_name=doc_metadata.get("filename", "Unknown"),
+                clause_type=_detect_clause_type(clause),
+                section=clause["section"],
+                title=clause["title"],
+                text=clause["text"],
+                embedding=embedding,
+            )
 
 
 @router.post("/analyze")
 async def analyze_documents(request: AnalyzeRequest):
     """
-    Analyze uploaded documents for contradictions
-    
-    Args:
-        request: Analysis request with document IDs
-        
-    Returns:
-        Analysis results
+    Analyze uploaded documents for contradictions using a session-scoped collection.
     """
-    
+    cleanup_old_files(minutes=60)
+
     if not request.document_ids:
-        raise HTTPException(status_code=400, detail="No documents provided")
-    
+        raise HTTPException(400, "No documents provided")
+
+    analysis_id = str(uuid.uuid4())
+    collection_name = f"analysis_{analysis_id}"
+    client = VectorDBClient()
+    collection = None
+
     try:
-        # Get all clauses from vector DB
-        all_clauses = vector_db.get_all()
-        
+        print(f"🧠 Creating collection: {collection_name}")
+        collection = client.create_collection(name=collection_name)
+
+        _build_vector_db_for_documents(request.document_ids, collection)
+
+        all_clauses = collection.get_all()
+        print(f"📦 Clause count in collection: {len(all_clauses)}")
+
         if not all_clauses:
-            raise HTTPException(status_code=400, detail="No clauses extracted from documents")
-        
-        # Detect contradictions
-        contradictions = rag_pipeline.analyze_contradictions(all_clauses)
-        
-        # Sort by risk level
-        risk_order = {"high": 0, "medium": 1, "low": 2}
+            raise HTTPException(400, "No clauses extracted")
+
+        contradictions = rag_pipeline.analyze_contradictions(all_clauses, collection)
+
         contradictions.sort(
-            key=lambda x: risk_order.get(x.get("risk_level", "low"), 3)
+            key=lambda x: {"high": 0, "medium": 1, "low": 2}.get(
+                x.get("risk_level", "low"), 3
+            )
         )
-        
+
         result = {
             "document_ids": request.document_ids,
             "total_documents": len(set(c.get("document_id") for c in all_clauses)),
@@ -73,119 +128,75 @@ async def analyze_documents(request: AnalyzeRequest):
             "contradictions": contradictions,
             "timestamp": datetime.now().isoformat(),
         }
-        
-        # Cache result
+
         analysis_cache[str(request.document_ids)] = result
-        
         return result
-    
+
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Analysis error: {e}")
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-
-@router.get("/contradictions")
-async def get_contradictions():
-    """Get cached contradictions"""
-    if not analysis_cache:
-        raise HTTPException(status_code=404, detail="No analysis available")
-    
-    # Return latest analysis
-    latest = list(analysis_cache.values())[-1]
-    return {"contradictions": latest.get("contradictions", [])}
-
-
-@router.get("/risks")
-async def get_risks():
-    """Get risk assessment summary"""
-    if not analysis_cache:
-        raise HTTPException(status_code=404, detail="No analysis available")
-    
-    latest = list(analysis_cache.values())[-1]
-    contradictions = latest.get("contradictions", [])
-    
-    return {
-        "high_risk": [c for c in contradictions if c.get("risk_level") == "high"],
-        "medium_risk": [c for c in contradictions if c.get("risk_level") == "medium"],
-        "low_risk": [c for c in contradictions if c.get("risk_level") == "low"],
-        "total": len(contradictions),
-    }
+        traceback.print_exc()
+        raise HTTPException(500, f"Analysis failed: {str(e)}")
+    finally:
+        if collection:
+            print(f"🧹 Deleting collection: {collection_name}")
+            client.delete_collection(name=collection_name)
 
 
 @router.post("/ask")
 async def ask_question(request: QuestionRequest):
     """
-    Ask a question about the contracts
-    
-    Args:
-        request: Question request
-        
-    Returns:
-        Answer with evidence
+    Answer a question using a session-scoped collection.
     """
-    
+    cleanup_old_files(minutes=60)
+
     if not request.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty")
-    
-    if not vector_db.get_all():
-        raise HTTPException(status_code=400, detail="No documents analyzed yet")
-    
+        raise HTTPException(400, "Question empty")
+
+    doc_ids = request.document_ids or (
+        list(analysis_cache.values())[-1]["document_ids"]
+        if analysis_cache else []
+    )
+
+    if not doc_ids:
+        raise HTTPException(400, "No documents available")
+
+    analysis_id = str(uuid.uuid4())
+    collection_name = f"analysis_{analysis_id}"
+    client = VectorDBClient()
+    collection = None
+
     try:
-        answer = rag_pipeline.answer_question(request.question)
+        print(f"🧠 Creating collection: {collection_name}")
+        collection = client.create_collection(name=collection_name)
+
+        _build_vector_db_for_documents(doc_ids, collection)
+
+        if not collection.get_all():
+            raise HTTPException(status_code=400, detail="No documents analyzed yet")
+
+        answer = rag_pipeline.answer_question(request.question, collection)
         return answer
+
     except Exception as e:
-        print(f"Question answering error: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to answer question: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+    finally:
+        if collection:
+            print(f"🧹 Deleting collection: {collection_name}")
+            client.delete_collection(name=collection_name)
 
 
-@router.get("/export")
-async def export_report(format: str = "pdf"):
-    """
-    Export analysis report
-    
-    Args:
-        format: Output format (pdf or json)
-        
-    Returns:
-        Report in requested format
-    """
-    
-    if not analysis_cache:
-        raise HTTPException(status_code=404, detail="No analysis available")
-    
-    latest = list(analysis_cache.values())[-1]
-    
-    if format == "json":
-        return latest
-    
-    elif format == "pdf":
-        # In production, use a library like reportlab or weasyprint
-        # For now, return JSON that frontend can convert
-        report_content = _generate_pdf_content(latest)
-        return report_content
-    
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported format")
+def _detect_clause_type(clause: dict) -> str:
+    text = (clause.get("title", "") + clause.get("text", "")).lower()
 
+    if "confidential" in text:
+        return "Confidentiality"
+    if "termination" in text:
+        return "Termination"
+    if "intellectual" in text:
+        return "IP Rights"
+    if "salary" in text:
+        return "Compensation"
 
-def _generate_pdf_content(analysis_result: dict) -> dict:
-    """Generate PDF-ready content"""
-    
-    contradictions = analysis_result.get("contradictions", [])
-    
-    # Create structured report
-    report = {
-        "title": "PactLens Analysis Report",
-        "generated_at": analysis_result.get("timestamp"),
-        "summary": {
-            "total_documents": analysis_result.get("total_documents"),
-            "total_clauses": analysis_result.get("total_clauses"),
-            "total_contradictions": len(contradictions),
-        },
-        "contradictions": contradictions,
-        "disclaimer": "This report is for informational purposes only and does not constitute legal advice.",
-    }
-    
-    return report
+    return "General"

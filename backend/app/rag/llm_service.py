@@ -84,7 +84,7 @@ FAIL-SAFE BEHAVIOR:
             except ImportError:
                 print("Warning: google-generativeai library not installed. Using mock responses.")
     
-    def generate(self, prompt: str, temperature: float = 0.7) -> str:
+    def generate(self, prompt: str, temperature: float = 0.3) -> str:
         """
         Generate response from LLM with Indian law system prompt
         
@@ -118,7 +118,34 @@ FAIL-SAFE BEHAVIOR:
     def _get_mock_response(self, prompt: str) -> str:
         """Provide mock responses for development/testing (follows Indian law constraints)"""
         
-        # Simple heuristics for mock responses
+        # Check if this is a batch contradiction request (looks for "PAIR X" pattern)
+        if "pair" in prompt.lower() and "[" in prompt and "]" in prompt:
+            # Extract pair IDs from prompt to generate matching responses
+            import re
+            pair_ids = re.findall(r"pair\s+(\d+)", prompt.lower())
+            pair_ids = [int(pid) for pid in pair_ids] if pair_ids else [1]
+            
+            # Generate mock responses for each pair
+            results = []
+            for pair_id in pair_ids:
+                results.append({
+                    "pair_id": pair_id,
+                    "has_contradiction": True,
+                    "contradiction_type": "partial",
+                    "risk_level": "medium",
+                    "summary": f"Partial conflict found in clause pair {pair_id}",
+                    "explanation": "Document A restricts disclosure indefinitely, while Document B allows disclosure after 2 years. This creates ambiguity about post-employment obligations.",
+                    "indian_law_context": "Under the Indian Contract Act, 1872, non-compete and confidentiality clauses are enforceable only if reasonable in scope and duration. The conflicting terms may be challenged under principles of reasonableness and public policy.",
+                    "recommendations": [
+                        "Clarify which document takes precedence",
+                        "Consider non-compete clause limitations under Indian law (typically 2-3 years maximum)",
+                        "Consult a qualified lawyer practicing in India"
+                    ],
+                    "requires_lawyer": True
+                })
+            return json.dumps(results)
+        
+        # Single contradiction analysis (not batch)
         if "contradiction" in prompt.lower() or "contradict" in prompt.lower():
             return json.dumps({
                 "has_contradiction": True,
@@ -215,18 +242,62 @@ class EmbeddingsService:
         return embeddings
     
     def _get_mock_embedding(self, text: str) -> list:
-        """Generate mock embedding based on text hash for development"""
-        import hashlib
+        """
+        Generate semantic mock embedding based on text keywords.
+        Similar texts will have higher cosine similarity.
+        """
+        import re
         
-        # Use hash of text to generate consistent mock embedding
-        hash_val = hashlib.md5(text.encode()).hexdigest()
+        # Extract keywords and normalize
+        text_lower = text.lower()
+        words = re.findall(r'\b\w+\b', text_lower)
         
-        # Generate 1536-dimensional vector (standard size)
+        # Create keyword-based features
+        keywords = [
+            'confidential', 'disclosure', 'terminate', 'termination', 'payment', 
+            'liability', 'indemnity', 'warranty', 'breach', 'notice', 'days',
+            'agreement', 'party', 'parties', 'obligations', 'rights', 'shall',
+            'compensation', 'damages', 'dispute', 'arbitration', 'jurisdiction',
+            'intellectual', 'property', 'ownership', 'transfer', 'assignment',
+            'non-compete', 'non-disclosure', 'employment', 'contractor', 'vendor',
+            'purchase', 'sale', 'delivery', 'service', 'product', 'license'
+        ]
+        
+        # Count keyword occurrences
+        keyword_counts = {kw: words.count(kw) for kw in keywords}
+        
+        # Also extract numbers (for payment amounts, durations, etc.)
+        numbers = re.findall(r'\d+', text)
+        avg_number = sum(int(n) for n in numbers[:5]) / max(len(numbers[:5]), 1) if numbers else 0
+        
+        # Build embedding vector (384 dimensions for faster computation)
+        embedding = []
+        
+        # Add keyword-based dimensions
+        for kw in keywords:
+            count = keyword_counts.get(kw, 0)
+            # Normalize count to [0, 1] range with diminishing returns
+            normalized = min(count / 5.0, 1.0)
+            embedding.append(normalized)
+        
+        # Add text length feature
+        embedding.append(min(len(text) / 1000.0, 1.0))
+        
+        # Add average number feature (normalized)
+        embedding.append(min(avg_number / 1000.0, 1.0))
+        
+        # Pad to 384 dimensions with small random noise for uniqueness
         import random
-        random.seed(int(hash_val[:8], 16))
+        import hashlib
+        seed = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
+        random.seed(seed)
         
-        embedding = [random.random() * 2 - 1 for _ in range(1536)]
+        while len(embedding) < 384:
+            embedding.append(random.random() * 0.1)  # Small random component
         
-        # Normalize
+        # Normalize to unit vector
         norm = sum(x**2 for x in embedding) ** 0.5
-        return [x / norm for x in embedding]
+        if norm > 0:
+            embedding = [x / norm for x in embedding]
+        
+        return embedding
