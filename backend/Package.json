@@ -1,0 +1,31 @@
+{
+  "name": "pactlens-backend",
+  "version": "0.1.0",
+  "description": "FastAPI backend for PactLens - Analysis and risk assessment of legal documents",
+  "main": "app/main.py",
+  "type": "module",
+  "scripts": {
+    "dev": "uvicorn app.main:app --reload",
+    "start": "uvicorn app.main:app",
+    "test": "pytest",
+    "lint": "pylint app",
+    "format": "black app"
+  },
+  "keywords": [
+    "pactlens",
+    "legal-documents",
+    "risk-assessment",
+    "fastapi",
+    "rag",
+    "generative-ai"
+  ],
+  "author": "PactLens Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-repo/pactlens"
+  },
+  "engines": {
+    "python": ">=3.8"
+  }
+}

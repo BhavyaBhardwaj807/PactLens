@@ -68,6 +68,7 @@ setup.bat
 # Then:
 # Terminal 1 - Backend:
 cd backend
+python -m venv venv
 venv\Scripts\activate
 python -m uvicorn app.main:app --reload
 

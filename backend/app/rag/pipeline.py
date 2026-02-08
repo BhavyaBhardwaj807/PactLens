@@ -1,693 +1,878 @@
-"""
-PactLens Backend - RAG (Retrieval Augmented Generation) Pipeline
-Handles embeddings, similarity search, and AI-powered analysis
-
-Per-analysis operation:
-- FAISS/Vector DB created fresh for each analysis
-- No global state or persistence
-- Automatic memory cleanup after analysis completes
-"""
-
 import logging
 import re
-import numpy as np
-from typing import List, Dict, Tuple, Optional
 import json
-from json import JSONDecodeError
+from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class RAGPipeline:
-    """
-    Main RAG pipeline for contract analysis.
-
-    Operates on a per-analysis basis with:
-    - Session-specific vector database
-    - No global state
-    - Automatic resource cleanup
-    """
 
     def __init__(self, embeddings_service, llm_service):
         self.embeddings = embeddings_service
         self.llm = llm_service
-        self.metrics = {
-            "clauses_processed": 0,
-            "vector_searches": 0,
-            "llm_calls": 0,
-        }
 
-    def analyze_contradictions(self, clauses: List[Dict], vector_db) -> List[Dict]:
-        """
-        Optimized contradiction detection with minimal LLM calls.
-        
-        Optimizations:
-        - O(n log n) complexity via pre-grouping by clause type
-        - Top-K similarity search (only 3-5 comparisons per clause)
-        - Same-document filtering
-        - Duplicate pair prevention
-        - Similarity threshold filtering (>0.6 only)
-        
-        Args:
-            clauses: List of extracted clauses
-            vector_db: Session-specific vector database
-            
-        Returns:
-            List of detected contradictions
-        """
+    # =========================================================
+    # MAIN ENTRY
+    # =========================================================
+
+    def analyze_contradictions(
+        self,
+        clauses: List[Dict],
+        vector_db,
+        batch_size: int = 5,
+        similarity_threshold: float = 0.65,
+        confidence_threshold: float = 0.55,
+    ) -> List[Dict]:
+
+        logger.info(f"Analyzing {len(clauses)} clauses")
+
         contradictions = []
-        processed_pairs = set()  # Prevent A↔B and B↔A duplication
-        vector_searches = 0
-        llm_calls = 0
+        processed_pairs = set()
         batch_pairs = []
-        batch_size = 5  # Batch 5–10 clause pairs per LLM call
-        
-        # 🚀 OPTIMIZATION 1: Pre-group clauses by type and document
-        # Reduces search space from O(n²) to O(n log n)
-        clauses_by_type = {}
-        unique_docs = set()
-        
-        for clause in clauses:
-            clause_type = clause.get("clause_type", "General")
-            doc_id = clause.get("document_id")
-            unique_docs.add(doc_id)
-            
-            if clause_type not in clauses_by_type:
-                clauses_by_type[clause_type] = []
-            clauses_by_type[clause_type].append(clause)
-        
-        print(f"\n🔍 ANALYZING {len(clauses)} clauses from {len(unique_docs)} documents")
-        print(f"Grouped by type: {[(t, len(c)) for t, c in clauses_by_type.items()]}")
-        
-        # 🚀 OPTIMIZATION 2: Only process types with clauses from multiple documents
+
+        clauses_by_type = self._group_by_type(clauses)
+
         for clause_type, type_clauses in clauses_by_type.items():
-            # Skip if all clauses are from same document (no cross-doc comparison possible)
-            docs_in_type = set(c.get("document_id") for c in type_clauses)
-            if len(docs_in_type) < 2:
-                print(f"⏭️  Skipping '{clause_type}' - only in 1 document")
+
+            docs = {c.get("document_id") for c in type_clauses}
+            if len(docs) < 2:
                 continue
-            
-            print(f"\n📋 Processing '{clause_type}' ({len(type_clauses)} clauses from {len(docs_in_type)} docs)")
-            
+
             for clause in type_clauses:
-                clause_doc = clause.get("document_id")
-                
-                # Get embedding for this clause
-                query_embedding = self._get_clause_embedding(clause)
-                
-                # 🚀 OPTIMIZATION 3: Top-K similarity search with threshold
-                # Only get top 3 most similar clauses (not all)
-                similar_clauses = vector_db.query(
-                    query_embedding,
-                    clause_type=clause_type,  # Same type only
-                    exclude_document_id=clause_doc,  # Different document only
-                    top_k=3,  # Reduced from 5 to 3 for speed
+
+                query_emb = self._get_clause_embedding(clause)
+
+                candidates = vector_db.query(
+                    query_emb,
+                    clause_type=clause_type,
+                    exclude_document_id=clause.get("document_id"),
+                    top_k=5,
                 )
-                
-                vector_searches += 1
-                
-                # 🚀 HYBRID APPROACH: Embeddings + Regex + Numeric
-                # Accept clauses with EITHER:
-                # 1. High embedding similarity (>0.60)
-                # 2. Matching regex patterns (same clause type indicators)
-                # 3. Conflicting numbers/dates (potential contradictions)
-                
-                hybrid_matches = []
-                for c in similar_clauses:
-                    embedding_sim = c.get("similarity_score", 0)
-                    clause_text = clause.get("text", "")
-                    candidate_text = c.get("text", "")
-                    
-                    # Signal 1: Embedding similarity
-                    has_embedding_match = embedding_sim > 0.60
-                    
-                    # Signal 2: Regex pattern match (same clause patterns)
-                    has_regex_match = self._has_pattern_overlap(clause_text, candidate_text)
-                    
-                    # Signal 3: Numeric/date conflicts (different values)
-                    has_numeric_conflict = self._has_numeric_conflict(clause_text, candidate_text)
-                    
-                    # Accept if ANY signal is positive
-                    if has_embedding_match or has_regex_match or has_numeric_conflict:
-                        # Store match reason for debugging
-                        c["match_reason"] = []
-                        if has_embedding_match:
-                            c["match_reason"].append(f"embedding:{embedding_sim:.2f}")
-                        if has_regex_match:
-                            c["match_reason"].append("regex")
-                        if has_numeric_conflict:
-                            c["match_reason"].append("numeric")
-                        hybrid_matches.append(c)
-                
-                if not hybrid_matches:
-                    continue
-                
-                print(f"  ✅ Found {len(hybrid_matches)} hybrid matches for clause from {clause_doc[:8]}")
-                
-                for candidate in hybrid_matches:
-                    print(f"     → Match reason: {', '.join(candidate.get('match_reason', []))}")
-                    # 🚀 OPTIMIZATION 5: Prevent duplicate pairs
-                    pair_key = tuple(sorted([clause.get("id"), candidate.get("id")]))
+
+                for cand in candidates:
+
+                    sim = cand.get("similarity_score", 0)
+
+                    if not self._is_valid_match(
+                        clause, cand, sim, similarity_threshold
+                    ):
+                        continue
+
+                    pair_key = tuple(sorted([
+                        clause.get("id"),
+                        cand.get("id"),
+                    ]))
+
                     if pair_key in processed_pairs:
                         continue
+
                     processed_pairs.add(pair_key)
-
-                    # 🚀 NEW OPTIMIZATION: If extremely similar, avoid LLM unless rules detect conflict
-                    similarity_score = candidate.get("similarity_score", 0.0)
-                    if similarity_score >= 0.92:
-                        # Rule-based quick check (numbers/dates) to detect potential conflicts
-                        potential_conflict = self._rule_based_conflict(
-                            clause.get("text", ""),
-                            candidate.get("text", ""),
-                        )
-
-                        if not potential_conflict:
-                            # Clauses are highly similar and no rule-based conflict detected
-                            # Skip LLM call to save cost and latency
-                            continue
                     
-                    batch_pairs.append(
-                        {
-                            "pair_id": len(batch_pairs) + 1,
-                            "clause_a": clause,
-                            "clause_b": candidate,
-                            "clause_type": clause_type,
-                            "similarity_score": similarity_score,
-                        }
-                    )
+                    # 🔥 DEBUG
+                    print("MATCH FOUND:", clause["text"][:60])
+
+                    batch_pairs.append({
+                        "pair_id": len(batch_pairs)+1,
+                        "clause_a": clause,
+                        "clause_b": cand,
+                        "clause_type": clause_type,
+                        "similarity_score": sim,
+                    })
 
                     if len(batch_pairs) >= batch_size:
-                        llm_calls += 1
-                        print(f"  🤖 LLM batch call #{llm_calls}: {len(batch_pairs)} pairs")
-                        batch_results = self._detect_contradictions_batch(batch_pairs)
-                        contradictions.extend(batch_results)
+                        contradictions.extend(
+                            self._process_batch(batch_pairs)
+                        )
                         batch_pairs = []
 
-        # Process any remaining pairs in the final batch
         if batch_pairs:
-            llm_calls += 1
-            print(f"  🤖 LLM batch call #{llm_calls}: {len(batch_pairs)} pairs")
-            batch_results = self._detect_contradictions_batch(batch_pairs)
-            contradictions.extend(batch_results)
+            contradictions.extend(
+                self._process_batch(batch_pairs)
+            )
 
-        self.metrics.update({
-            "clauses_processed": len(clauses),
-            "vector_searches": vector_searches,
-            "llm_calls": llm_calls,
-        })
+        print(f"\n📊 Before filtering: {len(contradictions)} contradictions")
         
-        print(f"\n{'='*60}")
-        print(f"📊 ANALYSIS COMPLETE")
-        print(f"   Clauses: {len(clauses)} | Searches: {vector_searches} | LLM calls: {llm_calls}")
-        print(f"   Contradictions found: {len(contradictions)}")
-        print(f"{'='*60}\n")
+        # 🔥 DEBUG: Check first contradiction structure
+        if contradictions:
+            print(f"🔍 Sample contradiction structure:")
+            print(f"  - Title: {contradictions[0].get('title', 'N/A')}")
+            print(f"  - Clauses count: {len(contradictions[0].get('clauses', []))}")
+            if contradictions[0].get('clauses'):
+                print(f"  - Clause A keys: {list(contradictions[0]['clauses'][0].keys())}")
+                print(f"  - Clause A text length: {len(contradictions[0]['clauses'][0].get('text', ''))}")
         
-        logger.info(
-            "rag.contradiction_analysis",
-            extra={
-                "clauses_processed": len(clauses),
-                "vector_searches": vector_searches,
-                "llm_calls": llm_calls,
-                "contradictions": len(contradictions),
-            },
+        # 🔥 Confidence filtering
+        contradictions = [
+            c for c in contradictions
+            if c.get("confidence_score", 0) >= confidence_threshold
+        ]
+        
+        print(f"📊 After confidence filter (>={confidence_threshold}): {len(contradictions)} contradictions")
+
+        # 🔥 Smart deduplication
+        contradictions = self._smart_dedupe(contradictions)
+        print(f"📊 After deduplication: {len(contradictions)} contradictions")
+        
+        # 🔥 Group similar contradictions by clause type
+        contradictions = self._collapse_by_type(contradictions)
+        print(f"📊 After collapsing by type: {len(contradictions)} contradiction groups")
+
+        # 🔥 Sort by: 1) Risk level, 2) Priority (legal importance), 3) Confidence
+        contradictions.sort(
+            key=lambda x: (
+                -{"high":3,"medium":2,"low":1}[x.get("risk_level","low")],  # High risk first
+                x.get("priority", 99),  # Legal priority order
+                -x.get("confidence_score",0)  # High confidence first
+            )
         )
+        print(f"📊 Sorted by risk, priority, and confidence")
+
+        logger.info(f"Final contradictions: {len(contradictions)}")
+        print(f"\n🎉 FINAL CONTRADICTIONS COUNT: {len(contradictions)}")
+        print(f"FINAL CONTRADICTIONS: {contradictions}\n")
 
         return contradictions
 
-    def _detect_contradiction(
-        self,
-        clause_a: Dict,
-        clause_b: Dict,
-        clause_type: str,
-        similarity_score: float = 0.0,
-    ) -> Dict | None:
-        """
-        Detect if two clauses contradict each other
-        Uses LLM for semantic analysis
-        """
+    # =========================================================
+    # MATCHING LOGIC
+    # =========================================================
+
+    def _is_valid_match(self, clause, candidate, similarity, threshold):
+
+        text_a = clause.get("text","")
+        text_b = candidate.get("text","")
+
+        has_regex = self._has_pattern_overlap(text_a, text_b)
+        has_numeric = self._has_numeric_conflict(text_a, text_b)
+
+        # 🔥 STRICTER RULES - require BOTH similarity AND semantic conflict
+        if has_numeric and similarity >= 0.60:
+            return True
         
-        base_prompt = f"""
-Analyze if these two clauses from different contracts contradict or conflict. Restrict ALL reasoning to Indian law only. If applicability to Indian law is unclear, state that the clause may be unenforceable or ambiguous under Indian law. Do NOT reference US/UK/EU or international law.
+        if has_regex and similarity >= 0.70:
+            return True
+        
+        if similarity >= 0.75:
+            return True
 
-Document A: {clause_a.get('document_name', 'Unknown')}
-Section: {clause_a.get('section', 'N/A')}
-{clause_a.get('text', '')}
+        return False
 
-Document B: {clause_b.get('document_name', 'Unknown')}
-Section: {clause_b.get('section', 'N/A')}
-{clause_b.get('text', '')}
+    # =========================================================
+    # BATCH PROCESSING
+    # =========================================================
 
-Respond ONLY as JSON with:
-{{
-    "has_contradiction": true/false,
-    "contradiction_type": "direct"|"partial"|"ambiguous",
-    "risk_level": "high"|"medium"|"low",
-    "summary": "One sentence summary",
-    "explanation": "Plain English explanation for a non-lawyer",
-    "indian_law_context": "How this applies in India or if unenforceable",
-    "recommendations": ["action1", "action2"],
-    "requires_lawyer": true/false
-}}
+    def _process_batch(self, pairs):
 
-Always include this disclaimer verbatim: "This analysis is for informational purposes only and does not constitute legal advice under Indian law."
-If legal reasoning falls outside Indian jurisdiction, refuse and explain why.
-"""
+        results = self._detect_contradictions_batch(pairs)
+        return results or []
 
-        strict_prompt = base_prompt + "\nReturn STRICT JSON only. No prose, no markdown."
+    # =========================================================
+    # DEDUPLICATION
+    # =========================================================
 
-        try:
-            result = self._safe_llm_json(
-                base_prompt,
-                strict_prompt,
-                required_keys={"has_contradiction", "contradiction_type", "risk_level"},
-            )
+    def _smart_dedupe(self, contradictions):
+        """Remove true duplicates based on clause text pairs (text-based hashing)"""
+        seen = set()
+        unique = []
 
-            if not result or not result.get("has_contradiction"):
-                return None
+        print(f"\n🔍 DEDUPE DEBUG: Starting with {len(contradictions)} contradictions")
 
-            allowed_types = {"direct", "partial", "ambiguous"}
-            allowed_risks = {"high", "medium", "low"}
+        for idx, c in enumerate(contradictions):
+            try:
+                a = c["clauses"][0]["text"].strip().lower()[:100]  # First 100 chars
+                b = c["clauses"][1]["text"].strip().lower()[:100]
+                key = tuple(sorted([a, b]))
 
-            contradiction_type = result.get("contradiction_type", "ambiguous")
-            if contradiction_type not in allowed_types:
-                contradiction_type = "ambiguous"
+                if idx < 3:  # Show first 3
+                    print(f"  Pair {idx+1}: '{a[:50]}...' vs '{b[:50]}...'")
+                
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(c)
+                else:
+                    if idx < 3:
+                        print(f"    ❌ DUPLICATE - already seen")
+            except Exception as e:
+                print(f"  ⚠️ Error processing contradiction {idx}: {e}")
+                # Add it anyway if there's an error
+                unique.append(c)
+        
+        # 🔥 Fix #3: Debug print
+        print(f"🧹 After dedupe: {len(unique)} unique contradictions (removed {len(contradictions) - len(unique)} duplicates)\n")
 
-            risk_level = result.get("risk_level", "medium")
-            if risk_level not in allowed_risks:
-                risk_level = "medium"
+        return unique
 
-            confidence = self._compute_confidence(
-                similarity_score=similarity_score,
-                contradiction_type=contradiction_type,
-                risk_level=risk_level,
-            )
+    def _generate_smart_summary(self, clause_type, clauses, conflict_count):
+        """Generate human-readable summary based on clause type and content"""
+        
+        if clause_type == "Confidentiality":
+            # Extract duration info from clause text
+            durations = []
+            for clause in clauses:
+                text = clause.get("text", "").lower()
+                if "year" in text:
+                    import re
+                    nums = re.findall(r'(\d+)\s*year', text)
+                    durations.extend([int(n) for n in nums])
+            
+            if durations:
+                min_dur = min(durations)
+                max_dur = max(durations)
+                if min_dur == max_dur:
+                    return f"Confidentiality terms specify {min_dur} year duration with varying conditions. Review for consistency."
+                else:
+                    return f"Confidentiality terms vary between {min_dur}–{max_dur} years and include penalty clauses. Standardization recommended."
+            return f"Confidentiality clauses contain conflicting terms. Review {conflict_count} instances for consistency."
+        
+        elif clause_type == "Compensation":
+            # Extract salary info
+            amounts = []
+            for clause in clauses:
+                text = clause.get("text", "")
+                import re
+                # Look for INR amounts
+                nums = re.findall(r'INR\s*([\d,]+)', text)
+                amounts.extend(nums)
+            
+            if amounts:
+                return f"Payment terms differ across documents (INR {', '.join(amounts[:3])}). Define which prevails."
+            return f"Compensation terms are inconsistent across {conflict_count} clauses. Ensure clarity to avoid disputes."
+        
+        elif clause_type == "Notice Period":
+            # Extract notice periods
+            periods = []
+            for clause in clauses:
+                text = clause.get("text", "").lower()
+                import re
+                nums = re.findall(r'(\d+)\s*day', text)
+                periods.extend([int(n) for n in nums])
+            
+            if periods:
+                return f"Notice period requirements vary between {min(periods)}–{max(periods)} days. Standardize to avoid confusion."
+            return f"Notice period clauses are inconsistent. Review {conflict_count} instances."
+        
+        else:
+            # Generic summary for other types
+            return f"{conflict_count} inconsistent clauses detected. These may affect enforceability under Indian law."
 
-            return {
-                "title": f"Conflict in {clause_type}",
-                "summary": result.get("summary", ""),
-                "clauses": [
-                    {**clause_a, "similarity_score": similarity_score},
-                    {**clause_b, "similarity_score": similarity_score},
-                ],
-                "risk_level": risk_level,
-                "risk_explanation": result.get("explanation", ""),
-                "indian_law_note": result.get("indian_law_context"),
-                "recommendations": result.get("recommendations", []),
-                "requires_lawyer": result.get("requires_lawyer", risk_level == "high"),
-                "confidence_score": confidence,
-                "disclaimer": "This analysis is for informational purposes only and does not constitute legal advice under Indian law.",
-            }
-        except Exception:
-            logger.exception("rag.contradiction_detection_failed")
-            return None
+    def _is_valid_clause(self, clause_text):
+        """Filter out title/header clauses that aren't real content"""
+        if not clause_text:
+            return False
+        
+        text = clause_text.strip()
+        
+        # Skip very short text (likely headers)
+        if len(text.split()) < 8:
+            return False
+        
+        # Skip all-caps headers
+        if text.isupper():
+            return False
+        
+        # Skip document titles
+        if any(keyword in text.upper() for keyword in ["EMPLOYMENT AGREEMENT", "OFFER LETTER", "COMPANY:", "LOCATION:"]):
+            return False
+        
+        return True
+    
+    def _collapse_by_type(self, contradictions):
+        """Collapse multiple contradictions of the same type into grouped summaries"""
+        
+        # Friendly names and legal impact descriptions
+        FRIENDLY_NAMES = {
+            "General": "Contract Terms",
+            "Confidentiality": "Confidentiality",
+            "Compensation": "Compensation",
+            "Termination": "Termination",
+            "Notice": "Notice Period",
+            "Jurisdiction": "Jurisdiction"
+        }
+        
+        IMPACT_MESSAGES = {
+            "Confidentiality": "Conflicting confidentiality durations may weaken enforceability and create ambiguity post-employment under Indian Contract Act, 1872.",
+            "Compensation": "Payment term differences can lead to disputes and may be challenged under principles of contract clarity.",
+            "Termination": "Inconsistent termination clauses may reduce enforceability and create legal uncertainty.",
+            "Contract Terms": "Inconsistent obligations or timelines may reduce legal clarity and enforceability.",
+            "Notice Period": "Varying notice requirements across documents create ambiguity and potential disputes.",
+            "Jurisdiction": "Conflicting jurisdiction clauses may complicate dispute resolution."
+        }
+        
+        # Context-specific recommendations
+        RECOMMENDATIONS = {
+            "Confidentiality": [
+                "Standardize confidentiality duration across all documents",
+                "Consider non-compete clause limitations under Indian law (typically 2-3 years maximum)",
+                "Consult a qualified lawyer practicing in India"
+            ],
+            "Compensation": [
+                "Ensure salary and payment terms are consistent across all documents",
+                "Define which document takes precedence in case of mismatch",
+                "Consult a qualified lawyer practicing in India"
+            ],
+            "Termination": [
+                "Harmonize termination conditions across all agreements",
+                "Clarify notice periods and termination rights",
+                "Consult a qualified lawyer practicing in India"
+            ],
+            "Notice Period": [
+                "Standardize notice period requirements",
+                "Ensure consistency between employment agreement and offer letter",
+                "Consult a qualified lawyer practicing in India"
+            ],
+            "Contract Terms": [
+                "Review all conflicting terms for consistency",
+                "Harmonize obligations across all documents",
+                "Consult a qualified lawyer practicing in India"
+            ]
+        }
+        
+        # Priority order for legal importance
+        PRIORITY_ORDER = {
+            "Confidentiality": 1,
+            "Compensation": 2,
+            "Termination": 3,
+            "Notice": 4,
+            "Jurisdiction": 5,
+            "Contract Terms": 6
+        }
+        
+        # Group by clause type
+        by_type = {}
+        for c in contradictions:
+            clause_type = c["clauses"][0].get("clause_type", "General")
+            if clause_type not in by_type:
+                by_type[clause_type] = []
+            by_type[clause_type].append(c)
+        
+        collapsed = []
+        
+        for clause_type, items in by_type.items():
+            display_type = FRIENDLY_NAMES.get(clause_type, clause_type)
+            impact = IMPACT_MESSAGES.get(display_type, f"These inconsistencies may weaken enforceability under Indian law.")
+            
+            if len(items) == 1:
+                # Only one contradiction - enhance with better messaging
+                item = items[0].copy()
+                item["title"] = f"{display_type} Conflict"
+                item["risk_explanation"] = impact
+                item["clause_type_display"] = display_type
+                item["priority"] = PRIORITY_ORDER.get(display_type, 99)
+                collapsed.append(item)
+            else:
+                # Multiple contradictions - create grouped summary
+                all_clause_pairs = []
+                risk_levels = [c.get("risk_level", "low") for c in items]
+                
+                # Collect all clause pairs
+                for c in items:
+                    all_clause_pairs.extend(c.get("clauses", []))
+                
+                # 🔥 Filter out title/header clauses and deduplicate by text
+                unique_clauses = {}
+                for clause in all_clause_pairs:
+                    text = clause.get("text", "").strip()
+                    if self._is_valid_clause(text):
+                        key = text.lower()
+                        if key not in unique_clauses:
+                            unique_clauses[key] = clause
+                
+                deduped_clauses = list(unique_clauses.values())[:10]  # Limit to 10 unique clauses
+                
+                # Determine highest risk
+                if "high" in risk_levels:
+                    risk = "high"
+                elif "medium" in risk_levels:
+                    risk = "medium"
+                else:
+                    risk = "low"
+                
+                # Generate human-readable summary based on clause type
+                summary = self._generate_smart_summary(display_type, deduped_clauses, len(items))
+                
+                # Get context-specific recommendations
+                recommendations = RECOMMENDATIONS.get(display_type, [
+                    f"Review all {len(items)} {display_type.lower()} conflicts for consistency",
+                    "Harmonize terms across all documents to avoid disputes",
+                    "Consult a qualified lawyer practicing in India"
+                ])
+                
+                # Create grouped contradiction
+                grouped = {
+                    "title": f"Multiple {display_type} Conflicts",
+                    "summary": summary,
+                    "risk_level": risk,
+                    "risk_explanation": impact,
+                    "recommendations": recommendations,
+                    "confidence_score": max(c.get("confidence_score", 0) for c in items),
+                    "clauses": deduped_clauses,  # Use deduplicated clauses
+                    "conflict_count": len(items),
+                    "clause_type_display": display_type,
+                    "priority": PRIORITY_ORDER.get(display_type, 99)
+                }
+                
+                collapsed.append(grouped)
+                print(f"  📦 Collapsed {len(items)} {clause_type} conflicts into '{display_type}' group ({len(deduped_clauses)} unique clauses)")
+        
+        return collapsed
 
-    def _detect_contradictions_batch(self, pairs: List[Dict]) -> List[Dict]:
-        """
-        Batch multiple clause pair comparisons into a single LLM call.
+    def _group_by_type(self, contradictions):
+        """Group contradictions by clause type for organized display"""
+        grouped = {}
 
-        Args:
-            pairs: List of dicts with keys: pair_id, clause_a, clause_b, clause_type, similarity_score
+        for c in contradictions:
+            t = c["clauses"][0].get("clause_type", "General")
 
-        Returns:
-            List of detected contradictions (same format as _detect_contradiction)
-        """
+            if t not in grouped:
+                grouped[t] = []
+
+            grouped[t].append(c)
+
+        return grouped
+
+    # =========================================================
+    # GROUPING
+    # =========================================================
+
+    def _group_by_type(self, clauses):
+        groups = {}
+        for c in clauses:
+            t = c.get("clause_type","General")
+            groups.setdefault(t, []).append(c)
+        return groups
+
+    # =========================================================
+    # LLM BATCH DETECTION
+    # =========================================================
+
+    def _detect_contradictions_batch(self, pairs):
+
         if not pairs:
             return []
 
         prompt = self._build_batch_prompt(pairs)
-        strict_prompt = prompt + "\nReturn STRICT JSON only. No prose, no markdown."
+
+        raw = self.llm.generate_answer(prompt, mode="contradiction", temperature=0.2)
+
+        print("🤖 LLM RAW:", raw[:500])
 
         try:
-            results = self._safe_llm_json_list(
-                prompt,
-                strict_prompt,
-                required_keys={"pair_id", "has_contradiction"},
-            )
+            data = json.loads(raw)
+        except Exception as e:
+            logger.warning(f"Batch JSON parse failed: {e}")
+            print(f"❌ JSON parse failed: {e}")
+            return []
 
-            if not results:
-                # Fallback: process individually on parse failure
-                logger.warning("rag.batch_parse_failed_fallback_to_single")
-                return self._fallback_single_pairs(pairs)
+        contradictions = []
 
-            results_by_id = {r.get("pair_id"): r for r in results if isinstance(r, dict)}
+        # CASE 1: LLM returned single object
+        if isinstance(data, dict):
 
-            contradictions = []
+            if not data.get("has_contradiction"):
+                print("⚠️  LLM returned no contradiction (single object)")
+                return []
+
+            print(f"📦 LLM returned single object - applying to all {len(pairs)} pairs")
+
             for pair in pairs:
-                pair_id = pair.get("pair_id")
-                result = results_by_id.get(pair_id)
+                # 🔥 Clone the result for each pair
+                new_result = {
+                    "title": f"Conflict in {pair['clause_type']}",
+                    "summary": data.get("summary",""),
+                    "risk_level": data.get("risk_level","medium"),
+                    "risk_explanation": data.get("explanation",""),
+                    "recommendations": data.get("recommendations",[]),
+                    "confidence_score": 0.8
+                }
+                
+                # Set unique clauses for this pair
+                new_result["clauses"] = [
+                    pair["clause_a"],
+                    pair["clause_b"]
+                ]
+                
+                contradictions.append(new_result)
 
-                if not result:
-                    # Partial failure: fallback to single pair
-                    single = self._detect_contradiction(
-                        pair["clause_a"],
-                        pair["clause_b"],
-                        pair["clause_type"],
-                        similarity_score=pair.get("similarity_score", 0.0),
-                    )
-                    if single:
-                        contradictions.append(single)
-                    continue
-
-                if not result.get("has_contradiction"):
-                    continue
-
-                allowed_types = {"direct", "partial", "ambiguous"}
-                allowed_risks = {"high", "medium", "low"}
-
-                contradiction_type = result.get("contradiction_type", "ambiguous")
-                if contradiction_type not in allowed_types:
-                    contradiction_type = "ambiguous"
-
-                risk_level = result.get("risk_level", "medium")
-                if risk_level not in allowed_risks:
-                    risk_level = "medium"
-
-                confidence = self._compute_confidence(
-                    similarity_score=pair.get("similarity_score", 0.0),
-                    contradiction_type=contradiction_type,
-                    risk_level=risk_level,
-                )
-
-                contradictions.append(
-                    {
-                        "title": f"Conflict in {pair.get('clause_type')}",
-                        "summary": result.get("summary", ""),
-                        "clauses": [
-                            {**pair["clause_a"], "similarity_score": pair.get("similarity_score", 0.0)},
-                            {**pair["clause_b"], "similarity_score": pair.get("similarity_score", 0.0)},
-                        ],
-                        "risk_level": risk_level,
-                        "risk_explanation": result.get("explanation", ""),
-                        "indian_law_note": result.get("indian_law_context"),
-                        "recommendations": result.get("recommendations", []),
-                        "requires_lawyer": result.get("requires_lawyer", risk_level == "high"),
-                        "confidence_score": confidence,
-                        "disclaimer": "This analysis is for informational purposes only and does not constitute legal advice under Indian law.",
-                    }
-                )
-
+            print(f"✅ Created {len(contradictions)} contradictions from single object")
             return contradictions
-        except Exception:
-            logger.exception("rag.batch_contradiction_detection_failed")
-            return self._fallback_single_pairs(pairs)
 
-    def _build_batch_prompt(self, pairs: List[Dict]) -> str:
-        """
-        Build a batch prompt with numbered clause pairs and clear JSON output requirements.
-        """
+        # CASE 2: LLM returned list with pair_ids
+        elif isinstance(data, list):
+
+            print(f"📦 LLM returned list with {len(data)} items")
+            results_by_id = {r["pair_id"]: r for r in data if "pair_id" in r}
+
+            for pair in pairs:
+                r = results_by_id.get(pair["pair_id"])
+                if not r or not r.get("has_contradiction"):
+                    continue
+
+                # 🔥 Clone the result for each pair
+                new_result = {
+                    "title": f"Conflict in {pair['clause_type']}",
+                    "summary": r.get("summary",""),
+                    "risk_level": r.get("risk_level","medium"),
+                    "risk_explanation": r.get("explanation",""),
+                    "recommendations": r.get("recommendations",[]),
+                    "confidence_score": 0.8
+                }
+                
+                # Set unique clauses for this pair
+                new_result["clauses"] = [
+                    pair["clause_a"],
+                    pair["clause_b"]
+                ]
+                
+                contradictions.append(new_result)
+
+            print(f"✅ Created {len(contradictions)} contradictions from list")
+            return contradictions
+
+        print("⚠️  Unknown data format from LLM")
+        return []
+
+    # =========================================================
+    # PROMPT BUILDER
+    # =========================================================
+
+    def _build_batch_prompt(self, pairs):
+
         header = (
-            "Analyze each clause pair below for contradictions under Indian law only. "
-            "If applicability to Indian law is unclear, state that the clause may be unenforceable or ambiguous. "
-            "Do NOT reference US/UK/EU or international law.\n\n"
-            "Return ONLY a JSON array with one item per pair, preserving pair_id.\n"
-            "Output format:\n"
-            "[\n"
-            "  {\"pair_id\": 1, \"has_contradiction\": true/false, \"contradiction_type\": \"direct|partial|ambiguous\", "
-            "\"risk_level\": \"high|medium|low\", \"summary\": \"...\", \"explanation\": \"...\", "
-            "\"indian_law_context\": \"...\", \"recommendations\": [\"...\"], \"requires_lawyer\": true/false},\n"
-            "  ...\n"
-            "]\n\n"
+            "Analyze contradictions under Indian law.\n"
+            "Return ONLY JSON array.\n\n"
         )
 
-        body_lines = []
-        for pair in pairs:
-            clause_a = pair["clause_a"]
-            clause_b = pair["clause_b"]
-            pair_id = pair["pair_id"]
-            clause_type = pair.get("clause_type", "General")
+        blocks = []
 
-            body_lines.append(
-                f"PAIR {pair_id} (Type: {clause_type}):\n"
-                f"Document A: {clause_a.get('document_name', 'Unknown')} | Section: {clause_a.get('section', 'N/A')}\n"
-                f"{clause_a.get('text', '')}\n\n"
-                f"Document B: {clause_b.get('document_name', 'Unknown')} | Section: {clause_b.get('section', 'N/A')}\n"
-                f"{clause_b.get('text', '')}\n"
-            )
+        for p in pairs:
+            a = p["clause_a"]
+            b = p["clause_b"]
 
-        return header + "\n---\n".join(body_lines)
-
-    def _safe_llm_json_list(
-        self,
-        prompt: str,
-        strict_prompt: str,
-        required_keys: set,
-    ) -> Optional[List[Dict]]:
-        """
-        Call LLM and parse JSON array response safely.
-        """
-
-        def _parse(txt: str) -> Optional[List[Dict]]:
-            try:
-                data = json.loads(txt)
-                if not isinstance(data, list):
-                    return None
-                for item in data:
-                    if not isinstance(item, dict) or not required_keys.issubset(item.keys()):
-                        return None
-                return data
-            except JSONDecodeError:
-                return None
-
-        r = self.llm.generate(prompt)
-        parsed = _parse(r)
-        if parsed:
-            return parsed
-
-        r = self.llm.generate(strict_prompt, temperature=0.1)
-        return _parse(r)
-
-    def _fallback_single_pairs(self, pairs: List[Dict]) -> List[Dict]:
-        """
-        Safe fallback: run single-pair detection when batch parsing fails.
-        """
-        contradictions = []
-        for pair in pairs:
-            single = self._detect_contradiction(
-                pair["clause_a"],
-                pair["clause_b"],
-                pair["clause_type"],
-                similarity_score=pair.get("similarity_score", 0.0),
-            )
-            if single:
-                contradictions.append(single)
-        return contradictions
-
-    def answer_question(self, question: str, vector_db) -> Dict:
-
-        question_embedding = self.embeddings.embed_text(question)
-
-        relevant_clauses = vector_db.search(question_embedding, top_k=6)
-
-        context = ""
-        for clause in relevant_clauses:
-            context += clause.get("text", "")[:500] + "\n"
-
-        prompt = f"""
-Answer under Indian law only.
-
-{context}
-
-Question: {question}
-
-Return JSON:
-{{
-    "answer": "",
-    "confidence": 0.0,
-    "requires_lawyer": false
-}}
+            blocks.append(
+f"""
+PAIR {p['pair_id']}:
+A: {a.get("text","")}
+B: {b.get("text","")}
 """
+            )
 
-        strict_prompt = prompt + "\nReturn STRICT JSON only."
+        return header + "\n".join(blocks)
 
-        try:
-            result = self._safe_llm_json(
-                prompt,
-                strict_prompt,
-                required_keys={"answer", "confidence", "requires_lawyer"},
-            ) or {}
+    # =========================================================
+    # EMBEDDINGS
+    # =========================================================
 
-            return {
-                "question": question,
-                "answer": result.get("answer", ""),
-                "confidence_score": result.get("confidence", 0.5),
-                "requires_lawyer": result.get("requires_lawyer", False),
-            }
+    def _get_clause_embedding(self, clause):
+        return self.embeddings.embed_text(
+            clause.get("text","")
+        )
 
-        except Exception:
-            logger.exception("rag.answer_question_failed")
-            return {
-                "question": question,
-                "answer": "Failed to answer",
-                "confidence_score": 0.0,
-                "requires_lawyer": True,
-            }
-
-    # ✅ FIXED HERE
-    def _get_clause_embedding(self, clause: Dict) -> List[float]:
-        """Always compute embedding from text (no global vector_db)."""
-        return self.embeddings.embed_text(clause.get("text", ""))
-
-    def _safe_llm_json(
-        self,
-        prompt: str,
-        strict_prompt: str,
-        required_keys: set,
-    ) -> Optional[Dict]:
-
-        def _parse(txt):
-            try:
-                data = json.loads(txt)
-                if required_keys.issubset(data.keys()):
-                    return data
-            except JSONDecodeError:
-                return None
-            return None
-
-        r = self.llm.generate(prompt)
-        parsed = _parse(r)
-        if parsed:
-            return parsed
-
-        r = self.llm.generate(strict_prompt, temperature=0.1)
-        return _parse(r)
-
-    def _rule_based_conflict(self, text_a: str, text_b: str) -> bool:
-        """
-        Lightweight rule-based conflict check for very similar clauses.
-
-        Rules:
-        - Duration numbers differ (e.g., 30 days vs 60 days)
-        - Payment amounts differ (e.g., 10,000 vs 15,000)
-        - Dates differ (e.g., 01/01/2025 vs 01/03/2025)
-
-        Returns:
-            True if potential conflict found, else False.
-        """
-        numbers_a = self._extract_numbers(text_a)
-        numbers_b = self._extract_numbers(text_b)
-
-        dates_a = self._extract_dates(text_a)
-        dates_b = self._extract_dates(text_b)
-
-        # If both have numbers but sets differ, flag potential conflict
-        if numbers_a and numbers_b and numbers_a != numbers_b:
-            return True
-
-        # If both have dates but sets differ, flag potential conflict
-        if dates_a and dates_b and dates_a != dates_b:
-            return True
-
-        return False
-
-    def _extract_numbers(self, text: str) -> set:
-        """
-        Extract numeric values (including currency-like numbers) from text.
-        Examples: 30, 60, 10,000, 15.5
-        """
-        # Match integers and decimals with optional commas
-        pattern = r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b"
-        matches = re.findall(pattern, text)
-
-        # Normalize: remove commas for comparison
-        normalized = {m.replace(",", "") for m in matches}
-        return normalized
-
-    def _extract_dates(self, text: str) -> set:
-        """
-        Extract common date formats from text.
-        Examples: 01/01/2025, 2025-01-31, 1 Jan 2025
-        """
-        date_patterns = [
-            r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",  # 01/01/2025 or 1-1-25
-            r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b",      # 2025-01-31
-            r"\b\d{1,2}\s(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s\d{2,4}\b",
-        ]
-
-        matches = set()
-        for pattern in date_patterns:
-            found = re.findall(pattern, text, flags=re.IGNORECASE)
-            matches.update([f.lower() for f in found])
-
-        return matches
-    
-    def _has_pattern_overlap(self, text_a: str, text_b: str) -> bool:
-        """
-        Check if two clauses share common legal patterns/keywords.
-        Returns True if they likely discuss the same topic.
-        """
-        # Define pattern groups for common contract elements
-        pattern_groups = [
-            # Confidentiality patterns
-            [r"confidential", r"disclosure", r"non-disclosure", r"proprietary", r"secret"],
-            # Termination patterns
-            [r"terminat", r"end\s+agreement", r"cancel", r"rescind", r"notice\s+period"],
-            # Payment patterns
-            [r"payment", r"compensation", r"fee", r"invoice", r"remuneration"],
-            # Liability patterns
-            [r"liability", r"indemnif", r"warrant", r"represent", r"guarantee"],
-            # Duration patterns
-            [r"\d+\s+days?", r"\d+\s+months?", r"\d+\s+years?", r"duration", r"term"],
-            # Non-compete patterns
-            [r"non-compete", r"non\s+compete", r"restrict", r"prohibit", r"not\s+engage"],
-        ]
-        
-        text_a_lower = text_a.lower()
-        text_b_lower = text_b.lower()
-        
-        # Check each pattern group
-        for patterns in pattern_groups:
-            matches_a = sum(1 for p in patterns if re.search(p, text_a_lower))
-            matches_b = sum(1 for p in patterns if re.search(p, text_b_lower))
-            
-            # If both clauses have 2+ matches from same pattern group, they overlap
-            if matches_a >= 2 and matches_b >= 2:
-                return True
-        
-        return False
-    
-    def _has_numeric_conflict(self, text_a: str, text_b: str) -> bool:
-        """
-        Detect if two clauses have conflicting numeric values.
-        Returns True if they discuss same topic but have different numbers.
-        """
-        numbers_a = self._extract_numbers(text_a)
-        numbers_b = self._extract_numbers(text_b)
-        dates_a = self._extract_dates(text_a)
-        dates_b = self._extract_dates(text_b)
-        
-        # Must have numbers/dates in BOTH clauses
-        if not (numbers_a or dates_a) or not (numbers_b or dates_b):
-            return False
-        
-        # Check for conflicting numbers
-        if numbers_a and numbers_b:
-            # If they share NO common numbers, likely conflict
-            common_numbers = numbers_a & numbers_b
-            if len(common_numbers) == 0 and len(numbers_a) > 0 and len(numbers_b) > 0:
-                return True
-        
-        # Check for conflicting dates
-        if dates_a and dates_b:
-            common_dates = dates_a & dates_b
-            if len(common_dates) == 0:
-                return True
-        
-        return False
+    # =========================================================
+    # CONFIDENCE
+    # =========================================================
 
     def _compute_confidence(
         self,
-        similarity_score: float,
-        contradiction_type: str,
-        risk_level: str,
-    ) -> float:
+        similarity,
+        ctype,
+        risk,
+    ):
 
-        confidence = similarity_score if similarity_score else 0.4
+        score = similarity
 
-        type_boost = {"direct": 0.2, "partial": 0.1, "ambiguous": -0.1}.get(
-            contradiction_type, 0
+        if ctype == "direct":
+            score += 0.2
+        elif ctype == "partial":
+            score += 0.1
+
+        if risk == "high":
+            score += 0.2
+        elif risk == "low":
+            score -= 0.1
+
+        return round(max(0,min(1,score)),3)
+
+    # =========================================================
+    # PATTERN MATCHING
+    # =========================================================
+
+    def _has_pattern_overlap(self, a,b):
+        words = ["terminate","payment","confidential","liability"]
+        a=a.lower(); b=b.lower()
+        return any(w in a and w in b for w in words)
+
+    def _has_numeric_conflict(self,a,b):
+        numsA=set(re.findall(r'\d+',a))
+        numsB=set(re.findall(r'\d+',b))
+        return numsA and numsB and numsA!=numsB
+
+    # =========================================================
+    # QUESTION ANSWERING
+    # =========================================================
+
+    # Intent detection keywords
+    INTENT_KEYWORDS = {
+        "post_termination": [
+            "after termination", "post termination", "after leaving",
+            "after resignation", "after employment", "once terminated",
+            "after contract ends", "post-employment"
+        ],
+        "compensation": [
+            "salary", "pay", "compensation", "wages", "payment",
+            "bonus", "benefits", "remuneration"
+        ],
+        "termination": [
+            "terminate", "termination", "end contract", "cancel",
+            "cancellation", "firing", "dismissal"
+        ],
+        "confidentiality": [
+            "confidential", "secret", "nda", "non-disclosure",
+            "proprietary information", "trade secrets"
+        ],
+        "ip": [
+            "intellectual property", "ip", "copyright", "patent",
+            "trademark", "ownership", "work product"
+        ],
+        "liability": [
+            "liability", "indemnity", "damages", "responsible",
+            "accountable", "liable"
+        ],
+        "non_compete": [
+            "non-compete", "non compete", "compete", "competition",
+            "restrictive covenant", "solicitation"
+        ]
+    }
+
+    # Intent to clause type mapping for boosting
+    INTENT_BOOST_MAP = {
+        "post_termination": ["confidentiality", "termination", "non-compete", "ip", "notice"],
+        "compensation": ["salary", "bonus", "compensation", "benefits", "payment"],
+        "termination": ["termination", "notice", "severance", "cause"],
+        "confidentiality": ["confidentiality", "nda", "proprietary", "trade secrets"],
+        "ip": ["intellectual property", "ip", "ownership", "work product"],
+        "liability": ["liability", "indemnity", "limitation", "damages"],
+        "non_compete": ["non-compete", "restrictive covenant", "solicitation"]
+    }
+
+    def _detect_intent(self, query: str) -> str:
+        """
+        Detect the intent/topic of a user's question.
+
+        Args:
+            query: User's question
+
+        Returns:
+            Intent category (e.g., 'post_termination', 'compensation', 'general')
+        """
+        q = query.lower()
+
+        # Check each intent category
+        for intent, keywords in self.INTENT_KEYWORDS.items():
+            if any(keyword in q for keyword in keywords):
+                return intent
+
+        return "general"
+
+    def _rewrite_query_with_llm(self, query: str) -> str:
+        """
+        Use LLM to rewrite user question into a better search query.
+
+        Args:
+            query: Original user question
+
+        Returns:
+            Rewritten search query optimized for legal clause retrieval
+        """
+        rewrite_prompt = f"""Rewrite this question into a focused legal search query.
+
+User Question: {query}
+
+Instructions:
+- Extract key legal concepts and obligations
+- Focus on searchable clause types (e.g., confidentiality, termination, compensation)
+- Include relevant timeframes (e.g., post-termination, during employment)
+- Keep it concise (1-2 sentences max)
+- Use legal terminology
+
+Search Query:"""
+
+        try:
+            rewritten = self.llm.generate(rewrite_prompt, max_tokens=100, temperature=0.2)
+            logger.info(f"Query rewritten: '{query}' → '{rewritten.strip()}'")
+            return rewritten.strip()
+        except Exception as e:
+            logger.warning(f"Query rewriting failed: {e}, using original")
+            return query
+
+    def _rerank_results(self, results: List[Dict], intent: str, boost_factor: float = 0.15) -> List[Dict]:
+        """
+        Re-rank search results based on detected intent.
+
+        Args:
+            results: Initial search results
+            intent: Detected intent category
+            boost_factor: Score boost for matching clauses
+
+        Returns:
+            Re-ranked results with adjusted scores
+        """
+        boosted_clauses = self.INTENT_BOOST_MAP.get(intent, [])
+
+        for result in results:
+            original_score = result.get("similarity_score", 0.0)
+            boost = 0.0
+
+            clause_text = result.get("text", "").lower()
+            clause_type = result.get("clause_type", "").lower()
+
+            # Boost if clause type or text matches intent
+            for keyword in boosted_clauses:
+                if keyword in clause_text or keyword in clause_type:
+                    boost += boost_factor
+                    break
+
+            result["adjusted_score"] = min(1.0, original_score + boost)
+
+        # Sort by adjusted score
+        return sorted(results, key=lambda x: x.get("adjusted_score", 0), reverse=True)
+
+    def answer_question(self, question: str, vector_db, top_k: int = 5) -> Dict:
+        """
+        Answer a question using semantic search over the document clauses.
+        
+        Args:
+            question: User's question about the contracts
+            vector_db: Vector database collection with clause embeddings
+            top_k: Number of relevant clauses to retrieve
+            
+        Returns:
+            Dict with 'answer' and 'evidence' fields
+        """
+        logger.info(f"\n🔵 ANSWERING QUESTION: {question}")
+        
+        # CRITICAL: Use question directly for embedding (not rewriting)
+        # Rewriting adds unnecessary complexity and can blur the query
+        question_embedding = self.embeddings.embed_text(question)
+        logger.info(f"✓ Generated embedding for question")
+        
+        # Search for relevant clauses with question embedding
+        initial_results = vector_db.query(
+            query_embedding=question_embedding,
+            top_k=top_k * 2,  # Fetch 2x for potential filtering
+            min_similarity=0.2  # Lower threshold before reranking
         )
+        
+        logger.info(f"✓ Retrieved {len(initial_results)} initial results from vector DB")
+        if initial_results:
+            logger.info(f"  Top result: {initial_results[0].get('clause_type', 'Unknown')} (score: {initial_results[0].get('similarity_score', 'N/A')})")
+        
+        # Detect intent for metadata filtering
+        intent = self._detect_intent(question)
+        logger.info(f"✓ Detected intent: {intent}")
+        
+        # Light filtering based on intent (but keep all results if intent is general)
+        filtered_results = initial_results
+        if intent != "general":
+            boosted_types = self.INTENT_BOOST_MAP.get(intent, [])
+            matching = [r for r in initial_results if any(
+                bt in r.get("clause_type", "").lower() or bt in r.get("text", "").lower()
+                for bt in boosted_types
+            )]
+            non_matching = [r for r in initial_results if r not in matching]
+            filtered_results = matching + non_matching
+            logger.info(f"✓ Intent-boosted: {len(matching)} matching, {len(non_matching)} other clauses")
+        
+        # Take top_k results
+        results = filtered_results[:top_k]
+        logger.info(f"✓ Final retrieval: {len(results)} clauses for answer generation")
+        
+        # Extract clauses and metadata
+        evidence = []
+        context_parts = []
+        
+        for i, result in enumerate(results, 1):
+            evidence.append({
+                "text": result.get("text", ""),
+                "document": result.get("document_name", result.get("document_id", "Unknown")),
+                "section": result.get("clause_type", "General"),
+                "page": result.get("section", "N/A")
+            })
+            
+            # Build context for LLM
+            doc_name = result.get("document_name", result.get("document_id", "Unknown"))
+            clause_type = result.get("clause_type", "General")
+            text = result.get("text", "")
+            context_parts.append(f"[{doc_name} - {clause_type}]: {text}")
+            logger.info(f"  [{i}] {clause_type} from {doc_name}")
+        
+        # If no relevant clauses found
+        if not context_parts:
+            logger.warning("⚠️ No relevant clauses found for this question")
+            return {
+                "answer": "I couldn't find relevant information in the uploaded contracts to answer this question.",
+                "evidence": []
+            }
+        
+        # Build prompt for LLM (simple and question-focused)
+        context = "\n\n".join(context_parts)
+        prompt = f"""User Question:
+{question}
 
-        risk_boost = {"high": 0.2, "medium": 0.1, "low": -0.1}.get(risk_level, 0)
+Relevant Contract Clauses:
+{context}
 
-        confidence += type_boost + risk_boost
-        return round(max(0.0, min(1.0, confidence)), 3)
+Answer the user's question clearly and directly based only on the evidence above.
+Return JSON with: answer, why_it_matters, practical_impact, confidence
+"""
+        
+        logger.info(f"✓ Built context with {len(context_parts)} clauses")
+        logger.info(f"✓ Calling LLM with QA_SYSTEM_PROMPT for answer generation")
+        
+        # Generate answer using LLM with QA system prompt
+        try:
+            answer_text = self.llm.generate(
+                prompt,
+                max_tokens=500,
+                temperature=0.3,
+                system_prompt=self.llm.QA_SYSTEM_PROMPT,
+            )
+            
+            logger.info(f"✓ LLM response received ({len(answer_text)} chars)")
+
+            # Parse structured JSON response
+            parsed = None
+            try:
+                parsed = json.loads(answer_text)
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to parse JSON response: {e}")
+                parsed = None
+            
+            if isinstance(parsed, dict) and "answer" in parsed:
+                result_dict = {
+                    "answer": parsed.get("answer", "").strip(),
+                    "why_it_matters": parsed.get("why_it_matters", ""),
+                    "practical_impact": parsed.get("practical_impact", ""),
+                    "confidence": parsed.get("confidence", 0.5),
+                    "evidence": evidence
+                }
+                logger.info(f"✓ Answer generated successfully\n")
+                return result_dict
+            else:
+                # Fallback if JSON parsing fails
+                logger.warning("⚠️ JSON parsing failed, returning raw response")
+                return {
+                    "answer": answer_text.strip(),
+                    "why_it_matters": "",
+                    "practical_impact": "",
+                    "confidence": 0.5,
+                    "evidence": evidence
+                }
+        except Exception as e:
+            logger.error(f"❌ Error generating answer: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "answer": f"Error generating answer: {str(e)}",
+                "evidence": evidence
+            }

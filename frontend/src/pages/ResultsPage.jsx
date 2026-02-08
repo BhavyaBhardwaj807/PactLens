@@ -4,6 +4,7 @@ import ContradictionCard from '../components/ContradictionCard';
 import QuestionBox from '../components/QuestionBox';
 import ExportPanel from '../components/ExportPanel';
 import RiskSummary from '../components/RiskSummary';
+import RiskHeatmap from '../components/RiskHeatmap';
 import { analysisAPI } from '../utils/api';
 import { Loader } from 'lucide-react';
 
@@ -16,6 +17,7 @@ export default function ResultsPage() {
   const [isAsking, setIsAsking] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [error, setError] = useState('');
+  const [showHeatmap, setShowHeatmap] = useState(false);
 
   useEffect(() => {
     if (!analysis) {
@@ -95,8 +97,35 @@ export default function ResultsPage() {
 
         {/* Risk Summary */}
         <div className="mb-8">
-          <RiskSummary risks={contradictions} />
+          <RiskSummary 
+            risks={contradictions}
+            riskScore={analysis?.risk_score}
+            riskLevel={analysis?.risk_level}
+            riskSummary={analysis?.risk_summary}
+          />
         </div>
+
+        {/* Heatmap Toggle Button */}
+        {analysis?.heatmap && !showHeatmap && (
+          <div className="mb-8 flex justify-center">
+            <button
+              onClick={() => setShowHeatmap(true)}
+              className="px-6 py-3 bg-gradient-to-r from-accent-cyan to-accent-blue text-dark-bg font-semibold rounded-lg hover:shadow-lg hover:shadow-accent-cyan/50 transition-all"
+            >
+              Want to visualise the risk?
+            </button>
+          </div>
+        )}
+
+        {/* Risk Heatmap */}
+        {analysis?.heatmap && showHeatmap && (
+          <div className="mb-8">
+            <RiskHeatmap 
+              heatmap={analysis.heatmap}
+              topRiskyCategory={analysis.top_risky_category}
+            />
+          </div>
+        )}
 
         {/* Main Content Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
